@@ -1,0 +1,14 @@
+{
+  "name": "resolve-bot",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "bun run resolve-bot.ts",
+    "register": "REGISTER_COMMANDS=1 bun run resolve-bot.ts"
+  },
+  "dependencies": {
+    "discord.js": "^14.25.1",
+    "pg": "^8.18.0"
+  }
+}
