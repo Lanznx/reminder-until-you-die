@@ -542,7 +542,7 @@ import {
     }
   });
   
-  client.once("ready", () => {
+  client.once("clientReady", () => {
     console.log(`[bot] logged in as ${client.user?.tag}`);
     console.log(`[bot] ping check every ${PING_CHECK_INTERVAL_MS}ms, default interval ${DEFAULT_INTERVAL_MIN}min`);
   
