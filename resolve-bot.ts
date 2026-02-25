@@ -158,6 +158,19 @@ import {
     return d;
   }
 
+  /**
+   * 解析延遲字串，回傳毫秒數。
+   * 支援格式：30m、4h、1d（不區分大小寫）
+   */
+  function parseDelay(input: string): number | null {
+    const match = input.trim().toLowerCase().match(/^(\d+)(m|h|d)$/);
+    if (!match) return null;
+    const amount = parseInt(match[1], 10);
+    const unit = match[2];
+    const multipliers: Record<string, number> = { m: 60_000, h: 3_600_000, d: 86_400_000 };
+    return amount * multipliers[unit];
+  }
+
   function taskEmbed(task: Record<string, unknown>, extra?: string) {
     const fields: { name: string; value: string; inline?: boolean }[] = [
       { name: "指派給", value: `<@${task.assignee_id}>`, inline: true },
@@ -220,6 +233,7 @@ import {
           .addUserOption((o) => o.setName("assignee").setDescription("指派給誰").setRequired(true))
           .addStringOption((o) => o.setName("description").setDescription("任務描述").setRequired(true))
           .addStringOption((o) => o.setName("due_date").setDescription("截止日期（明天、後天、下禮拜、3/15、2026-03-15）"))
+          .addStringOption((o) => o.setName("delay").setDescription("延遲首次提醒（例：4h、1d、30m）"))
           .addIntegerOption((o) => o.setName("interval").setDescription("Ping 間隔（分鐘）").setMinValue(1).setMaxValue(1440))
           .addRoleOption((o) => o.setName("escalate_to").setDescription("超時升級 ping 的 role"))
       )
@@ -255,6 +269,7 @@ import {
     const interval = i.options.getInteger("interval") ?? DEFAULT_INTERVAL_MIN;
     const escalateRole = i.options.getRole("escalate_to");
     const dueDateInput = i.options.getString("due_date");
+    const delayInput = i.options.getString("delay");
 
     let dueDate: Date | null = null;
     if (dueDateInput) {
@@ -268,15 +283,32 @@ import {
       }
     }
 
+    let firstPingAt = new Date();
+    if (delayInput) {
+      const delayMs = parseDelay(delayInput);
+      if (delayMs === null) {
+        await i.reply({
+          content: `❌ 無法解析延遲「${delayInput}」，請輸入如：30m、4h、1d`,
+          ephemeral: true,
+        });
+        return;
+      }
+      firstPingAt = new Date(Date.now() + delayMs);
+    }
+
     const { rows } = await pool.query(
-      `INSERT INTO resolve_tasks (guild_id, channel_id, assignee_id, creator_id, description, interval_minutes, escalate_to_role_id, due_date)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING *`,
-      [i.guildId, i.channelId, assignee.id, i.user.id, description, interval, escalateRole?.id ?? null, dueDate?.toISOString() ?? null]
+      `INSERT INTO resolve_tasks (guild_id, channel_id, assignee_id, creator_id, description, interval_minutes, escalate_to_role_id, due_date, next_ping_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING *`,
+      [i.guildId, i.channelId, assignee.id, i.user.id, description, interval, escalateRole?.id ?? null, dueDate?.toISOString() ?? null, firstPingAt.toISOString()]
     );
     const task = rows[0] as Record<string, unknown>;
 
+    const delayNotice = delayInput
+      ? `（將於 <t:${Math.floor(firstPingAt.getTime() / 1000)}:R> 開始提醒）`
+      : "";
+
     const msg = await i.reply({
-      content: `🔔 <@${assignee.id}> 你有一個新的待處理任務！`,
+      content: `🔔 <@${assignee.id}> 你有一個新的待處理任務！${delayNotice}`,
       embeds: [taskEmbed(task)],
       components: [taskButtons(String(task.task_id))],
       fetchReply: true,
@@ -406,7 +438,7 @@ import {
   
     const task = rows[0];
     const channel = await client.channels.fetch(task.channel_id);
-    if (channel?.isTextBased()) {
+    if (channel?.isSendable()) {
       await channel.send({
         content: `🔔 <@${newAssignee}> 你有一個待處理任務（由 <@${i.user.id}> 轉派）！`,
         embeds: [taskEmbed(task)],
@@ -432,7 +464,7 @@ import {
       for (const task of rows) {
         try {
           const channel = await client.channels.fetch(task.channel_id);
-          if (!channel?.isTextBased()) continue;
+          if (!channel?.isSendable()) continue;
   
           const isEscalation = task.ping_count >= task.max_pings_before_escalate && task.escalate_to_role_id;
   
