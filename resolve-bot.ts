@@ -44,6 +44,8 @@ import {
     ContextMenuCommandBuilder,
     ApplicationCommandType,
     UserSelectMenuBuilder,
+    ThreadAutoArchiveDuration,
+    type Message,
     type ChatInputCommandInteraction,
     type ButtonInteraction,
     type UserSelectMenuInteraction,
@@ -95,12 +97,14 @@ import {
         max_pings_before_escalate INT NOT NULL DEFAULT ${DEFAULT_MAX_PINGS},
         escalate_to_role_id TEXT,
         due_date           TIMESTAMPTZ,
+        thread_id          TEXT,
         created_at         TIMESTAMPTZ NOT NULL DEFAULT NOW(),
         resolved_at        TIMESTAMPTZ,
         resolved_by        TEXT
       );
 
       ALTER TABLE resolve_tasks ADD COLUMN IF NOT EXISTS due_date TIMESTAMPTZ;
+      ALTER TABLE resolve_tasks ADD COLUMN IF NOT EXISTS thread_id TEXT;
 
       CREATE INDEX IF NOT EXISTS idx_tasks_active_ping
         ON resolve_tasks (next_ping_at)
@@ -169,6 +173,25 @@ import {
     const unit = match[2];
     const multipliers: Record<string, number> = { m: 60_000, h: 3_600_000, d: 86_400_000 };
     return amount * multipliers[unit];
+  }
+
+  /**
+   * 建立或取得提醒討論串。
+   * - 若指令在頻道中執行：於任務訊息下方建立討論串，回傳 thread ID。
+   * - 若指令本身在討論串中執行：直接沿用該討論串，回傳 channel ID。
+   * - 若建立失敗（如 DM 或無權限）：回傳 null，降級為頻道發送。
+   */
+  async function ensureThread(replyMsg: Message, threadName: string): Promise<string | null> {
+    if (replyMsg.channel.isThread()) return replyMsg.channelId;
+    try {
+      const thread = await replyMsg.startThread({
+        name: threadName.slice(0, 100),
+        autoArchiveDuration: ThreadAutoArchiveDuration.OneWeek,
+      });
+      return thread.id;
+    } catch {
+      return null;
+    }
   }
 
   function taskEmbed(task: Record<string, unknown>, extra?: string) {
@@ -314,7 +337,11 @@ import {
       fetchReply: true,
     });
 
-    await pool.query(`UPDATE resolve_tasks SET tracking_message_id = $1 WHERE task_id = $2`, [msg.id, task.task_id]);
+    const threadId = await ensureThread(msg as Message, description);
+    await pool.query(
+      `UPDATE resolve_tasks SET tracking_message_id = $1, thread_id = $2 WHERE task_id = $3`,
+      [msg.id, threadId, task.task_id]
+    );
   }
   
   async function handleTaskList(i: ChatInputCommandInteraction) {
@@ -367,8 +394,12 @@ import {
       components: [taskButtons(task.task_id)],
       fetchReply: true,
     });
-  
-    await pool.query(`UPDATE resolve_tasks SET tracking_message_id = $1 WHERE task_id = $2`, [reply.id, task.task_id]);
+
+    const threadId = await ensureThread(reply as Message, description);
+    await pool.query(
+      `UPDATE resolve_tasks SET tracking_message_id = $1, thread_id = $2 WHERE task_id = $3`,
+      [reply.id, threadId, task.task_id]
+    );
   }
   
   // ─── Button Handlers ──────────────────────────────────────────────────────────
@@ -437,7 +468,8 @@ import {
     await i.update({ content: `🔄 已重新指派給 <@${newAssignee}>`, components: [] });
   
     const task = rows[0];
-    const channel = await client.channels.fetch(task.channel_id);
+    const targetId: string = task.thread_id ?? task.channel_id;
+    const channel = await client.channels.fetch(targetId);
     if (channel?.isSendable()) {
       await channel.send({
         content: `🔔 <@${newAssignee}> 你有一個待處理任務（由 <@${i.user.id}> 轉派）！`,
@@ -463,7 +495,8 @@ import {
   
       for (const task of rows) {
         try {
-          const channel = await client.channels.fetch(task.channel_id);
+          const targetId: string = task.thread_id ?? task.channel_id;
+          const channel = await client.channels.fetch(targetId);
           if (!channel?.isSendable()) continue;
   
           const isEscalation = task.ping_count >= task.max_pings_before_escalate && task.escalate_to_role_id;
